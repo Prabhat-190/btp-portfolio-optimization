@@ -209,6 +209,32 @@ def equal_weight(n: int) -> np.ndarray:
     return np.ones(n) / n
 
 
+def select_top_alpha(alpha: pd.Series, n: int = 5) -> list[str]:
+    """Masuda §5.2.1: each period keep the N names with the largest expected α."""
+    return list(pd.Series(alpha).nlargest(n).index)
+
+
+def allocate_by_alpha(
+    alpha: pd.Series,
+    returns: pd.DataFrame,
+    n_select: int = 5,
+    max_weight: float = MAX_WEIGHT,
+) -> tuple[np.ndarray, list[str]]:
+    """Select top-N by α, then mean–variance max-Sharpe on that sleeve."""
+    names = select_top_alpha(alpha, n_select)
+    sleeve = returns[names]
+    mu = pd.Series(alpha).reindex(names)
+    w_sleeve = markowitz_max_sharpe(mu, sleeve, max_weight=max_weight)
+    w = np.zeros(returns.shape[1])
+    col_index = {t: i for i, t in enumerate(returns.columns)}
+    for t, wi in zip(names, w_sleeve):
+        w[col_index[t]] = float(wi)
+    s = w.sum()
+    if s > 0:
+        w = w / s
+    return w, names
+
+
 def evaluate_weights(weights: np.ndarray, returns: pd.DataFrame, label: str) -> dict:
     stats = moments(weights, returns)
     stats["sharpe"] = sharpe_ratio(stats["mean"], stats["vol"])

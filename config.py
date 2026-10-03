@@ -39,13 +39,23 @@ TRADING_DAYS = 252
 MAX_WEIGHT = 0.30
 MIN_HISTORY_FRAC = 0.90
 
-# Walk-forward: 2y estimate window, quarterly out-of-sample hold.
+# Time-series split (Masuda 2024 §3.5): train before holdout, never shuffle.
+TRAIN_END = "2024-12-31"
+
+# Masuda §5.2.1: pick top-N by expected alpha, variance cap k.
+N_SELECT = 5
+VAR_CAP = 0.01
+SEQ_LEN = 20
+SGD_EPOCHS = 40
+SGD_LR = 0.05
+
+# Walk-forward diagnostic (optional).
 TRAIN_DAYS = 504
 TEST_DAYS = 63
 CVAR_ALPHA = 0.05
 
-# NSGA-III
-NSGA_PARTITIONS = 5
-NSGA_GENERATIONS = 80
+# Light higher-order extra only (not the main allocator).
+NSGA_PARTITIONS = 4
+NSGA_GENERATIONS = 40
 NSGA_SEED = 42
-N_PARETO_KEEP = 24
+N_PARETO_KEEP = 12

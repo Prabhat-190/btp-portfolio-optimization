@@ -32,6 +32,7 @@ class MarketData:
     meta: pd.DataFrame
     start: str
     end: str
+    ohlcv: dict[str, pd.DataFrame] | None = None
 
     @property
     def tickers(self) -> list[str]:
@@ -118,6 +119,14 @@ def build_market_data(
 
     prices = aligned[keep]
     benchmark_prices = aligned[benchmark]
+    ohlcv = {}
+    for field in ("Open", "High", "Low", "Volume"):
+        try:
+            panel = _extract_field(raw, field)[keep].reindex(aligned.index)
+            ohlcv[field] = panel
+        except (KeyError, ValueError):
+            continue
+    ohlcv["Close"] = prices
     returns = prices.pct_change().dropna()
     benchmark_returns = benchmark_prices.pct_change().dropna()
     returns, benchmark_returns = returns.align(benchmark_returns, join="inner", axis=0)
@@ -152,8 +161,9 @@ def build_market_data(
         f"NSE sample {returns.index.min().date()} → {returns.index.max().date()} | "
         f"{returns.shape[0]} days × {returns.shape[1]} names | benchmark {BENCHMARK_NAME}"
     )
+    ohlcv = {k: v.loc[returns.index] for k, v in ohlcv.items()}
     return MarketData(
-        prices=prices,
+        prices=prices.loc[returns.index],
         returns=returns,
         benchmark_prices=benchmark_prices.loc[returns.index],
         benchmark_returns=benchmark_returns,
@@ -161,6 +171,7 @@ def build_market_data(
         meta=meta,
         start=returns.index.min().date().isoformat(),
         end=returns.index.max().date().isoformat(),
+        ohlcv=ohlcv,
     )
 
 
@@ -206,6 +217,11 @@ def load_market_cache() -> MarketData | None:
     meta = pd.read_csv(meta_path)
     betas = pd.read_csv(beta_path, index_col=0).iloc[:, 0]
     bench_px = (1 + bench).cumprod()
+    ohlcv = {"Close": prices.loc[returns.index]}
+    for field in ("Open", "High", "Low", "Volume"):
+        path = DATA_DIR / f"nse_{field.lower()}.csv"
+        if path.exists():
+            ohlcv[field] = pd.read_csv(path, index_col=0, parse_dates=True).reindex(returns.index)
     return MarketData(
         prices=prices,
         returns=returns,
@@ -215,6 +231,7 @@ def load_market_cache() -> MarketData | None:
         meta=meta,
         start=returns.index.min().date().isoformat(),
         end=returns.index.max().date().isoformat(),
+        ohlcv=ohlcv,
     )
 
 
@@ -226,6 +243,11 @@ def save_market_cache(data: MarketData) -> None:
     data.benchmark_returns.to_csv(DATA_DIR / "nifty50_returns.csv")
     data.meta.to_csv(DATA_DIR / "universe.csv", index=False)
     data.betas.to_csv(DATA_DIR / "betas.csv")
+    if data.ohlcv:
+        for field, panel in data.ohlcv.items():
+            if field == "Close":
+                continue
+            panel.to_csv(DATA_DIR / f"nse_{field.lower()}.csv")
 
 
 def get_data(start: str = START_DATE, end: str | None = END_DATE) -> tuple:

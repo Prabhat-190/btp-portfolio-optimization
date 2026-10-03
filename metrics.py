@@ -9,6 +9,33 @@ from scipy.stats import kurtosis, skew
 from config import CVAR_ALPHA, RISK_FREE_ANNUAL, TRADING_DAYS
 
 
+def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Masuda (2024) Eq. 5.3, reported as a percent."""
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    denom = np.abs(yt) + np.abs(yp)
+    ok = denom > 1e-12
+    if not np.any(ok):
+        return float("nan")
+    return float(np.mean(np.abs(yp[ok] - yt[ok]) / denom[ok]) * 100.0)
+
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(np.asarray(y_pred) - np.asarray(y_true))))
+
+
+def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    err = np.asarray(y_pred) - np.asarray(y_true)
+    return float(np.mean(err**2))
+
+
+def expected_alpha(mu: pd.Series | np.ndarray, betas: pd.Series | np.ndarray, market_mu: float) -> pd.Series:
+    """Masuda Eq. 4.8: α_i = R̂_i − β_i R̂_m."""
+    mu_s = pd.Series(mu) if not isinstance(mu, pd.Series) else mu
+    beta_s = pd.Series(betas).reindex(mu_s.index)
+    return (mu_s - beta_s * market_mu).rename("expected_alpha")
+
+
 def daily_risk_free(rf_annual: float = RISK_FREE_ANNUAL) -> float:
     return rf_annual / TRADING_DAYS
 

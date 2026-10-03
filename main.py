@@ -1,21 +1,19 @@
-"""CLI for the IIT Kharagpur BTP: higher-order NSE portfolio optimisation."""
+"""CLI: Masuda-style hybrid ML stock selection on current NSE data."""
 
 from __future__ import annotations
 
 import argparse
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
-plt.rcParams["font.family"] = "DejaVu Sans"
-plt.rcParams["axes.unicode_minus"] = False
-
-from backtest import walk_forward
-from config import END_DATE, MAX_WEIGHT, OUTPUT_DIR, START_DATE
+from backtest import holdout_paths
+from config import END_DATE, MAX_WEIGHT, N_SELECT, OUTPUT_DIR, START_DATE, TRAIN_END
+from plots import plot_gradients, plot_holdout
 from data_pipeline import build_market_data, jarque_bera_table, load_market_cache, save_market_cache
-from metrics import historical_cvar
-from ml_models import historical_expected_returns, ridge_expected_returns
+from metrics import historical_cvar, pearson_kurtosis
+from ml_models import train_selection_models
 from portfolio_optimization import (
+    allocate_by_alpha,
     equal_weight,
     evaluate_weights,
     ledoit_wolf_cov,
@@ -25,67 +23,14 @@ from portfolio_optimization import (
     pareto_frame,
     select_best_sharpe,
 )
+from scipy.stats import skew
 
 
-def _save_baselines(rows: list[dict], returns: pd.DataFrame, weights_map: dict) -> pd.DataFrame:
-    out = []
-    for row, (name, w) in zip(rows, weights_map.items()):
-        rec = dict(row)
-        rec["cvar"] = historical_cvar(returns.values @ w)
-        for t, wi in zip(returns.columns, w):
-            rec[t] = float(wi)
-        out.append(rec)
-    df = pd.DataFrame(out)
-    df.to_csv(OUTPUT_DIR / "baselines.csv", index=False)
-    return df
-
-
-def _plot_pareto(front: pd.DataFrame, path) -> None:
-    fig, ax = plt.subplots(figsize=(8.2, 5.2))
-    sc = ax.scatter(
-        front["vol"] * 100,
-        front["mean"] * 252 * 100,
-        c=front["skew"],
-        cmap="viridis",
-        s=55,
-        edgecolor="k",
-        linewidth=0.3,
-    )
-    fig.colorbar(sc, ax=ax, label="Skewness")
-    ax.set_xlabel("Daily volatility (%)")
-    ax.set_ylabel("Annualised mean return proxy (%)")
-    ax.set_title("NSGA-III MVSK Pareto front — current NSE universe")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-
-
-def _plot_oos(oos: pd.DataFrame, path) -> None:
-    fig, ax = plt.subplots(figsize=(8.8, 5.0))
-    for col, label in {
-        "nsga3": "NSGA-III (best IS Sharpe)",
-        "min_var": "Min-variance",
-        "max_sharpe": "Max-Sharpe",
-        "equal": "Equal weight",
-        "nifty": "Nifty 50",
-    }.items():
-        equity = (1 + oos[col]).cumprod()
-        ax.plot(equity.index, equity.values, label=label, lw=1.6)
-    ax.set_title("Walk-forward wealth — NSE names vs Nifty 50")
-    ax.set_ylabel("Growth of INR 1")
-    ax.legend(frameon=False)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-
-
-def run(start: str, end: str | None, n_gen: int, skip_backtest: bool, refresh: bool = False) -> None:
+def run(start: str, end: str | None, refresh: bool, higher_order: bool) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("==================================================")
-    print(" IIT KGP BTP: MVSK Portfolio Optimisation")
-    print(" Current NSE / Nifty 50 data")
+    print(" IIT KGP BTP: Hybrid ML stock selection")
+    print(" Masuda (2024) on current NSE / Nifty 50 data")
     print("==================================================")
 
     market = None if refresh else load_market_cache()
@@ -94,74 +39,83 @@ def run(start: str, end: str | None, n_gen: int, skip_backtest: bool, refresh: b
         save_market_cache(market)
     else:
         print(f"Using cached NSE panel {market.start} → {market.end}")
+
     jb = jarque_bera_table(market.returns, market.meta)
     jb.to_csv(OUTPUT_DIR / "jarque_bera.csv", index=False)
     print("\nUniverse")
     print(market.meta.to_string(index=False))
-    print("\nJarque–Bera (reject normality at 5%)")
-    print(jb[["ticker", "name", "p_value", "reject_normal_5pct"]].to_string(index=False))
 
-    mu = historical_expected_returns(market.returns)
-    mu_ridge = ridge_expected_returns(market.returns)
-    cov = ledoit_wolf_cov(market.returns)
+    print("\n[1] PCA + prediction models (train ≤", TRAIN_END, ")")
+    fitted = train_selection_models(market)
+    fitted["summary"].to_csv(OUTPUT_DIR / "prediction_smape.csv", index=False)
+    fitted["predictions"].to_csv(OUTPUT_DIR / "prediction_by_ticker.csv", index=False)
+    fitted["gradients"].to_csv(OUTPUT_DIR / "gradient_norms.csv", index=False)
+    fitted["expected_alpha"].to_csv(OUTPUT_DIR / "expected_alpha.csv")
+    print(fitted["summary"].to_string(index=False))
+    print("\nExpected alpha vs Nifty 50 (Masuda Eq. 4.8)")
+    print(fitted["expected_alpha"].sort_values(ascending=False).to_string())
+    plot_gradients(fitted["gradients"], OUTPUT_DIR / "gradient_norms.png")
 
-    w_eq = equal_weight(market.returns.shape[1])
-    w_mv = markowitz_min_variance(market.returns, cov=cov)
-    w_ms = markowitz_max_sharpe(mu, market.returns, cov=cov)
-    weights, _ = optimize_nsga3(mu, market.returns, cov=cov, n_gen=n_gen)
-    front = pareto_frame(weights, market.returns, mu)
-    front.to_csv(OUTPUT_DIR / "pareto_front.csv", index=False)
-    best = select_best_sharpe(front)
-    w_nsga = best[market.returns.columns].to_numpy(dtype=float)
+    print("\n[2] Mean-variance on top-N expected alpha")
+    w_alpha, picked = allocate_by_alpha(fitted["expected_alpha"], market.returns, n_select=N_SELECT)
+    print("Selected sleeve:", ", ".join(picked))
+    train = market.returns.loc[market.returns.index <= pd.Timestamp(TRAIN_END)]
+    cov = ledoit_wolf_cov(train)
+    w_eq = equal_weight(train.shape[1])
+    w_mv = markowitz_min_variance(train, cov=cov)
+    w_ms = markowitz_max_sharpe(train.mean(), train, cov=cov)
+    rows = []
+    for label, w in [
+        ("equal-weight", w_eq),
+        ("min-variance", w_mv),
+        ("hist-max-sharpe", w_ms),
+        ("alpha-mvo", w_alpha),
+    ]:
+        rec = evaluate_weights(w, train, label)
+        rec["cvar"] = historical_cvar(train.values @ w)
+        rows.append(rec)
+    baselines = pd.DataFrame(rows)
+    baselines.to_csv(OUTPUT_DIR / "baselines.csv", index=False)
+    print(baselines[["portfolio", "mean", "vol", "skew", "kurtosis", "sharpe"]].to_string(index=False))
 
-    baseline_rows = [
-        evaluate_weights(w_eq, market.returns, "equal-weight"),
-        evaluate_weights(w_mv, market.returns, "min-variance"),
-        evaluate_weights(w_ms, market.returns, "max-sharpe"),
-        evaluate_weights(w_nsga, market.returns, "nsga3-best-sharpe"),
-    ]
-    baselines = _save_baselines(
-        baseline_rows,
-        market.returns,
-        {
-            "equal-weight": w_eq,
-            "min-variance": w_mv,
-            "max-sharpe": w_ms,
-            "nsga3-best-sharpe": w_nsga,
-        },
+    print("\n[3] Holdout mark-to-market after", TRAIN_END)
+    summary, daily = holdout_paths(
+        market.returns, market.benchmark_returns, fitted["expected_alpha"]
     )
-    print("\nIn-sample baselines")
-    print(baselines[["portfolio", "mean", "vol", "skew", "kurtosis", "sharpe", "largest_weight"]].to_string(index=False))
+    summary.to_csv(OUTPUT_DIR / "holdout_summary.csv")
+    daily.to_csv(OUTPUT_DIR / "holdout_daily.csv")
+    plot_holdout(daily, OUTPUT_DIR / "holdout_equity.png")
+    print(summary[["ann_return", "ann_vol", "sharpe", "cvar", "max_drawdown"]].to_string())
 
-    _plot_pareto(front, OUTPUT_DIR / "pareto_front.png")
+    hold = daily["alpha_mvo"]
+    print("\n[4] Higher-order check (diagnostic only)")
+    print(
+        f"Alpha-MVO holdout skew={skew(hold, bias=False):.3f}  "
+        f"Pearson kurtosis={float(pearson_kurtosis(hold.values)):.2f}"
+    )
+    print(f"Names rejecting normality (5%): {int(jb['reject_normal_5pct'].sum())}/{len(jb)}")
 
-    if not skip_backtest:
-        print("\nWalk-forward out-of-sample (2y train / 1q test)...")
-        summary, folds, oos = walk_forward(market.returns, market.benchmark_returns, n_gen=max(25, n_gen // 2))
-        summary.to_csv(OUTPUT_DIR / "walkforward_summary.csv")
-        folds.to_csv(OUTPUT_DIR / "walkforward_folds.csv", index=False)
-        oos.to_csv(OUTPUT_DIR / "walkforward_daily.csv")
-        _plot_oos(oos, OUTPUT_DIR / "walkforward_equity.png")
-        print(summary[["ann_return", "ann_vol", "sharpe", "cvar", "max_drawdown"]].to_string())
+    if higher_order:
+        print("\n[extra] Light NSGA-III MVSK on the train window...")
+        weights, _ = optimize_nsga3(train.mean(), train, cov=cov, n_gen=40)
+        front = pareto_frame(weights, train, train.mean())
+        front.to_csv(OUTPUT_DIR / "pareto_front.csv", index=False)
+        best = select_best_sharpe(front)
+        print(best[["mean", "vol", "skew", "kurtosis", "sharpe"]].to_string())
 
-    ridge_vs_hist = pd.DataFrame({"historical": mu, "ridge": mu_ridge})
-    ridge_vs_hist.to_csv(OUTPUT_DIR / "expected_returns.csv")
     print(f"\nArtifacts written to {OUTPUT_DIR}")
     print("==================================================")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="NSE MVSK portfolio BTP pipeline")
+    parser = argparse.ArgumentParser(description="Masuda-style NSE hybrid ML BTP")
     parser.add_argument("--start", default=START_DATE)
     parser.add_argument("--end", default=END_DATE)
-    parser.add_argument("--n-gen", type=int, default=80)
-    parser.add_argument("--skip-backtest", action="store_true")
-    parser.add_argument("--refresh", action="store_true", help="Re-download NSE prices")
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--higher-order", action="store_true", help="Optional MVSK extra")
     parser.add_argument("--max-weight", type=float, default=MAX_WEIGHT)
     args = parser.parse_args()
-    if args.max_weight != MAX_WEIGHT:
-        print(f"Note: concentration cap override {args.max_weight} is used only if you edit config.MAX_WEIGHT.")
-    run(start=args.start, end=args.end, n_gen=args.n_gen, skip_backtest=args.skip_backtest, refresh=args.refresh)
+    run(start=args.start, end=args.end, refresh=args.refresh, higher_order=args.higher_order)
 
 
 if __name__ == "__main__":
